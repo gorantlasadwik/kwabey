@@ -155,6 +155,11 @@ def scan_worker_task(job_config: dict):
     if mode == "single" and phone_param:
         gen = scraper.generate_input(phone=str(phone_param).strip())
         workers = 1  # single number needs only 1 worker
+    elif mode == "series":
+        gen = scraper.generate_input(
+            checkpoint=checkpoint if resume else None,
+            active_series_only=True
+        )
     elif mode == "list" and numbers_list:
         skipping = bool(checkpoint) if (resume and checkpoint in numbers_list) else False
         def list_gen():
@@ -170,11 +175,18 @@ def scan_worker_task(job_config: dict):
                 yield p
         gen = list_gen()
     elif mode == "range" and start_param is not None and end_param is not None:
-        gen = scraper.generate_input(
-            start=int(start_param),
-            end=int(end_param),
-            checkpoint=checkpoint if resume else None,
-        )
+        # If full 6-to-9 range was selected, automatically use active telecom series
+        if start_param == config.SCAN_START and end_param == config.SCAN_END:
+            gen = scraper.generate_input(
+                checkpoint=checkpoint if resume else None,
+                active_series_only=True
+            )
+        else:
+            gen = scraper.generate_input(
+                start=int(start_param),
+                end=int(end_param),
+                checkpoint=checkpoint if resume else None,
+            )
     else:
         broadcast_log("ERROR", "Invalid job parameters.")
         state.is_running = False
@@ -330,15 +342,13 @@ def scan_worker_task(job_config: dict):
 
 def auto_start_scan():
     """
-    Automatically starts the full 6→9 series scan on app boot.
+    Automatically starts the active Indian telecom series scan on app boot.
     Resumes from the Supabase cloud checkpoint if available.
     """
     time.sleep(3)  # brief delay so Flask is fully up
-    broadcast_log("INFO", "Auto-start: launching full 6→9 series scan...")
+    broadcast_log("INFO", "Auto-start: launching active Indian telecom series scan...")
     job = {
-        "mode": "range",
-        "start": config.SCAN_START,
-        "end": config.SCAN_END,
+        "mode": "series",
         "delay": config.REQUEST_DELAY,
         "url": config.DEFAULT_BASE_URL,
         "resume": True,

@@ -186,24 +186,108 @@ def save_result(
         logger.error(f"Failed to write local CSV backup for {record.get('phone_number')}: {e}")
 
 
+# ===========================================================================
+# ACTIVE INDIAN TELECOM OPERATOR SERIES (DoT / TRAI Allocated MSC Blocks)
+# Covers all 22 telecom circles (Jio, Airtel, Vodafone-Idea, BSNL, MTNL)
+# Format: (start_int, end_int_exclusive)
+# ===========================================================================
+
+ACTIVE_SERIES_BLOCKS = [
+    # ── 6-Series (Jio, Airtel, Vi new allocations) ──
+    (6000_000000, 6004_000000),   # 6000, 6001, 6002, 6003
+    (6200_000000, 6210_000000),   # 6200 - 6209
+    (6230_000000, 6240_000000),   # 6230 - 6239
+    (6260_000000, 6270_000000),   # 6260 - 6269
+    (6280_000000, 6300_000000),   # 6280 - 6299
+    (6300_000000, 6310_000000),   # 6300 - 6309
+    (6350_000000, 6400_000000),   # 6350 - 6399
+
+    # ── 7-Series (Jio, Airtel, Vi, BSNL) ──
+    (7000_000000, 7100_000000),   # 7000 - 7099
+    (7200_000000, 7300_000000),   # 7200 - 7299
+    (7300_000000, 7400_000000),   # 7300 - 7399
+    (7400_000000, 7500_000000),   # 7400 - 7499
+    (7500_000000, 7600_000000),   # 7500 - 7599
+    (7600_000000, 7700_000000),   # 7600 - 7699
+    (7700_000000, 7800_000000),   # 7700 - 7799
+    (7800_000000, 7900_000000),   # 7800 - 7899
+    (7900_000000, 8000_000000),   # 7900 - 7999
+
+    # ── 8-Series (All Operators) ──
+    (8000_000000, 8100_000000),   # 8000 - 8099
+    (8100_000000, 8200_000000),   # 8100 - 8199
+    (8200_000000, 8300_000000),   # 8200 - 8299
+    (8300_000000, 8400_000000),   # 8300 - 8399
+    (8400_000000, 8500_000000),   # 8400 - 8499
+    (8500_000000, 8600_000000),   # 8500 - 8599
+    (8600_000000, 8700_000000),   # 8600 - 8699
+    (8700_000000, 8800_000000),   # 8700 - 8799
+    (8800_000000, 8900_000000),   # 8800 - 8899
+    (8900_000000, 9000_000000),   # 8900 - 8999
+
+    # ── 9-Series (Airtel, Vi, BSNL, Jio - Prime Shopper Base) ──
+    (9000_000000, 9100_000000),   # 9000 - 9099
+    (9100_000000, 9200_000000),   # 9100 - 9199
+    (9200_000000, 9300_000000),   # 9200 - 9299
+    (9300_000000, 9400_000000),   # 9300 - 9399
+    (9400_000000, 9500_000000),   # 9400 - 9499 (BSNL/MTNL)
+    (9500_000000, 9600_000000),   # 9500 - 9599
+    (9600_000000, 9700_000000),   # 9600 - 9699
+    (9700_000000, 9800_000000),   # 9700 - 9799 (Airtel/Vi)
+    (9800_000000, 9900_000000),   # 9800 - 9899 (Highest density e-commerce)
+    (9900_000000, 10000_000000),  # 9900 - 9999
+]
+
+
+def generate_active_series(checkpoint: Optional[str] = None) -> Generator[str, None, None]:
+    """
+    Generates 10-digit mobile numbers exclusively across all active Indian telecom series.
+    Seamlessly resumes from the saved checkpoint without scanning unallocated number blocks.
+    """
+    cp_num = None
+    if checkpoint:
+        try:
+            cp_num = int(str(checkpoint).strip())
+        except (ValueError, TypeError):
+            cp_num = None
+
+    for block_start, block_end in ACTIVE_SERIES_BLOCKS:
+        # Case 1: Entire block is already completed before the checkpoint
+        if cp_num is not None and cp_num >= block_end - 1:
+            continue
+
+        # Case 2: Checkpoint falls inside this block -> resume from next number
+        if cp_num is not None and block_start <= cp_num < block_end:
+            start_from = cp_num + 1
+        else:
+            start_from = block_start
+
+        for num in range(start_from, block_end):
+            yield str(num)
+
+
 def generate_input(
     phone: Optional[str] = None,
     start: Optional[int] = None,
     end: Optional[int] = None,
     input_file: Optional[str] = None,
-    checkpoint: Optional[str] = None
+    checkpoint: Optional[str] = None,
+    active_series_only: bool = False,
 ) -> Generator[str, None, None]:
     """
-    Generates phone numbers from a single phone, range, or file, skipping already processed ones up to checkpoint.
+    Generates phone numbers from single phone, active series, range, or file.
     """
     if phone:
         yield str(phone).strip()
         return
 
+    if active_series_only:
+        yield from generate_active_series(checkpoint)
+        return
+
     skipping = bool(checkpoint)
 
     if input_file and os.path.exists(input_file):
-        # If checkpoint is not found in file, we don't want to skip everything
         with open(input_file, "r", encoding="utf-8") as f:
             lines = [l.strip() for l in f if l.strip() and not l.strip().startswith("#")]
         
@@ -218,7 +302,6 @@ def generate_input(
             yield p
 
     elif start is not None and end is not None:
-        # If the start is already past the checkpoint or checkpoint is outside [start, end), don't skip
         if skipping:
             try:
                 cp_num = int(checkpoint)
