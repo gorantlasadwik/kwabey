@@ -1,14 +1,18 @@
-"""
-Configuration settings for Kwabey Registration Data Recovery Scraper.
-"""
+import os
 
 # Target endpoint
 DEFAULT_BASE_URL = "https://kwabey.com/via_gt_ajax/try_to_login/"
 
 # HTTP Settings
-TIMEOUT = 10          # seconds per request
+TIMEOUT    = 10          # seconds per request
 USER_AGENT = "Kwabey-Recovery-Scraper/1.0"
-REQUEST_DELAY = 0.2   # delay in seconds between requests
+REQUEST_DELAY = 0.0      # no artificial delay — concurrency handles throughput
+
+# Concurrent scan settings
+# SCAN_WORKERS: number of simultaneous HTTP threads (tune via Render env var)
+# Render free tier: 20 is a safe default; paid tier can go 50-100
+SCAN_WORKERS        = int(os.environ.get("SCAN_WORKERS", "20"))
+CHECKPOINT_INTERVAL = int(os.environ.get("CHECKPOINT_INTERVAL", "500"))  # save checkpoint every N completions
 
 # Full scan range — 6-series to end of 9-series Indian mobile numbers
 SCAN_START = 6_000_000_000

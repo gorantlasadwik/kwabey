@@ -9,6 +9,7 @@ import os
 import queue
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 from datetime import datetime
 from typing import Optional
 
@@ -97,23 +98,50 @@ def broadcast_log(level: str, message: str, phone: str = "", status: str = ""):
 
 
 # ==========================================
-# BACKGROUND SCAN WORKER
+# CONCURRENT PHONE CHECKER (thread-safe)
+# ==========================================
+
+def _check_phone(phone: str, session: requests.Session, base_url: str) -> dict:
+    """
+    Checks a single phone number. Called concurrently from the thread pool.
+    Each call is fully independent and thread-safe.
+    """
+    timestamp = datetime.now().isoformat()
+    url = scraper.build_url(phone, base_url)
+    http_status, html_content, error = scraper.fetch_html(session, url)
+
+    if error is not None:
+        return {"phone": phone, "status": "ERROR", "http_status": None, "timestamp": timestamp, "error": error}
+
+    status, snippet = scraper.parse_response(html_content)
+    return {"phone": phone, "status": status, "http_status": http_status, "timestamp": timestamp, "snippet": snippet}
+
+
+# ==========================================
+# BACKGROUND SCAN WORKER  (concurrent)
 # ==========================================
 
 def scan_worker_task(job_config: dict):
+    """
+    Concurrent scan worker using a ThreadPoolExecutor.
+    - SCAN_WORKERS simultaneous HTTP requests
+    - Checkpoint saved every CHECKPOINT_INTERVAL completions
+    - Each worker has its own requests.Session for max connection reuse
+    """
     state.is_running = True
     state.stop_event.clear()
     state.start_time = time.time()
 
-    mode = job_config.get("mode", "range")
-    delay = float(job_config.get("delay", config.REQUEST_DELAY))
-    base_url = job_config.get("url", config.DEFAULT_BASE_URL)
-    resume = job_config.get("resume", True)
+    mode       = job_config.get("mode", "range")
+    base_url   = job_config.get("url", config.DEFAULT_BASE_URL)
+    resume     = job_config.get("resume", True)
+    workers    = config.SCAN_WORKERS
+    chk_every  = config.CHECKPOINT_INTERVAL
 
-    start_param = job_config.get("start", config.SCAN_START)
-    end_param = job_config.get("end", config.SCAN_END)
-    phone_param = job_config.get("phone")
-    numbers_list = job_config.get("numbers", [])
+    start_param   = job_config.get("start", config.SCAN_START)
+    end_param     = job_config.get("end",   config.SCAN_END)
+    phone_param   = job_config.get("phone")
+    numbers_list  = job_config.get("numbers", [])
 
     scraper.init_csv_files()
 
@@ -123,9 +151,10 @@ def scan_worker_task(job_config: dict):
     else:
         broadcast_log("INFO", f"Starting fresh from {start_param}")
 
-    # Build generator
+    # ── Build phone number generator ──────────────────────────────────────────
     if mode == "single" and phone_param:
         gen = scraper.generate_input(phone=str(phone_param).strip())
+        workers = 1  # single number needs only 1 worker
     elif mode == "list" and numbers_list:
         skipping = bool(checkpoint) if (resume and checkpoint in numbers_list) else False
         def list_gen():
@@ -151,66 +180,148 @@ def scan_worker_task(job_config: dict):
         state.is_running = False
         return
 
-    session = requests.Session()
-    session.headers.update({
-        "User-Agent": config.USER_AGENT,
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    })
+    broadcast_log(
+        "INFO",
+        f"Concurrent scan started — {workers} parallel workers | "
+        f"checkpoint every {chk_every} numbers"
+    )
 
-    broadcast_log("INFO", f"Scan started — Mode: {mode.upper()} | Range: {start_param} → {end_param}")
+    # ── One session per worker for connection pooling ─────────────────────────
+    def _make_session() -> requests.Session:
+        s = requests.Session()
+        s.headers.update({
+            "User-Agent": config.USER_AGENT,
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        })
+        # Larger connection pool to match worker count
+        adapter = requests.adapters.HTTPAdapter(
+            pool_connections=workers,
+            pool_maxsize=workers,
+            max_retries=1,
+        )
+        s.mount("https://", adapter)
+        s.mount("http://",  adapter)
+        return s
+
+    # Shared session (thread-safe for reads; each submit is independent)
+    session = _make_session()
+    completed_since_checkpoint = 0
+    last_checkpoint_phone = checkpoint or str(start_param)
 
     try:
-        for phone in gen:
-            if state.stop_event.is_set():
-                broadcast_log("WARNING", f"Scan stopped at {phone}. Checkpoint saved.", phone=phone)
-                break
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            # Submit phones in a sliding window: keep `workers*2` futures in flight
+            pending: dict = {}
+            phone_iter = iter(gen)
+            exhausted = False
 
-            timestamp = datetime.now().isoformat()
-            url = scraper.build_url(phone, base_url)
-            http_status, html_content, error = scraper.fetch_html(session, url)
+            def _submit_next():
+                """Try to submit the next phone number to the pool."""
+                nonlocal exhausted
+                if exhausted or state.stop_event.is_set():
+                    return
+                try:
+                    phone = next(phone_iter)
+                    fut = executor.submit(_check_phone, phone, session, base_url)
+                    pending[fut] = phone
+                except StopIteration:
+                    exhausted = True
 
-            with state.lock:
-                state.total_processed += 1
-                state.last_phone = phone
+            # Fill initial window
+            for _ in range(workers * 2):
+                _submit_next()
 
-            if error is not None:
-                with state.lock:
-                    state.error_count += 1
-                broadcast_log("ERROR", f"HTTP Error: {error}", phone=phone, status="ERROR")
-            else:
-                status, snippet = scraper.parse_response(html_content)
+            while pending:
+                if state.stop_event.is_set():
+                    # Cancel pending and break
+                    for f in list(pending):
+                        f.cancel()
+                    broadcast_log("WARNING",
+                        f"Scan stopped. Last checkpoint: {last_checkpoint_phone}")
+                    break
 
-                if status == "REGISTERED":
+                # Wait for at least one future to finish
+                done, _ = wait(pending, timeout=5, return_when=FIRST_COMPLETED)
+
+                for future in done:
+                    phone = pending.pop(future)
+                    try:
+                        result = future.result()
+                    except Exception as exc:
+                        broadcast_log("ERROR", f"Worker exception: {exc}", phone=phone)
+                        with state.lock:
+                            state.error_count += 1
+                            state.total_processed += 1
+                            state.last_phone = phone
+                        _submit_next()
+                        continue
+
+                    # ── Handle result ──────────────────────────────────────
                     with state.lock:
-                        state.registered_count += 1
-                    broadcast_log("SUCCESS", f"REGISTERED (HTTP {http_status})", phone=phone, status="REGISTERED")
-                    # Save only registered numbers to Supabase
-                    supabase_client.save_registered_number(phone, http_status, timestamp)
-                elif status == "UNREGISTERED":
-                    with state.lock:
-                        state.unregistered_count += 1
-                    broadcast_log("UNREGISTERED", "Unregistered", phone=phone, status="UNREGISTERED")
-                else:
-                    with state.lock:
-                        state.unknown_count += 1
-                    broadcast_log("WARNING", f"UNKNOWN ({snippet[:35]}...)", phone=phone, status="UNKNOWN")
+                        state.total_processed += 1
+                        state.last_phone = phone
 
-            # Always save checkpoint so we can resume after any restart
-            scraper.save_checkpoint(phone)
+                    if result["status"] == "ERROR":
+                        with state.lock:
+                            state.error_count += 1
+                        broadcast_log("ERROR", f"HTTP Error: {result.get('error')}",
+                                      phone=phone, status="ERROR")
 
-            if delay > 0:
-                sleep_chunks = int(delay / 0.05)
-                for _ in range(max(1, sleep_chunks)):
-                    if state.stop_event.is_set():
-                        break
-                    time.sleep(0.05)
+                    elif result["status"] == "REGISTERED":
+                        with state.lock:
+                            state.registered_count += 1
+                        broadcast_log("SUCCESS",
+                            f"REGISTERED (HTTP {result['http_status']})",
+                            phone=phone, status="REGISTERED")
+                        supabase_client.save_registered_number(
+                            phone, result["http_status"], result["timestamp"]
+                        )
+
+                    elif result["status"] == "UNREGISTERED":
+                        with state.lock:
+                            state.unregistered_count += 1
+                        # Only log occasionally to avoid terminal spam at high speed
+                        if state.total_processed % 50 == 0:
+                            broadcast_log("UNREGISTERED", "Unregistered", phone=phone)
+
+                    else:  # UNKNOWN
+                        with state.lock:
+                            state.unknown_count += 1
+                        broadcast_log("WARNING",
+                            f"UNKNOWN ({result.get('snippet','')[:35]}...)",
+                            phone=phone, status="UNKNOWN")
+
+                    # ── Checkpoint: save every N completions ───────────────
+                    last_checkpoint_phone = phone
+                    completed_since_checkpoint += 1
+                    if completed_since_checkpoint >= chk_every:
+                        scraper.save_checkpoint(phone)
+                        broadcast_log(
+                            "INFO",
+                            f"Checkpoint saved at {phone} "
+                            f"| processed: {state.total_processed:,} "
+                            f"| registered: {state.registered_count}"
+                        )
+                        completed_since_checkpoint = 0
+
+                    # Submit a new phone to keep the window full
+                    _submit_next()
 
     except Exception as e:
         broadcast_log("ERROR", f"Worker fatal exception: {str(e)}")
     finally:
+        # Save final checkpoint
+        scraper.save_checkpoint(last_checkpoint_phone)
         session.close()
         state.is_running = False
-        broadcast_log("INFO", "Scan job finished.")
+        elapsed = time.time() - state.start_time
+        rate = round(state.total_processed / max(elapsed, 1), 1)
+        broadcast_log(
+            "INFO",
+            f"Scan finished | processed: {state.total_processed:,} "
+            f"| registered: {state.registered_count} "
+            f"| avg speed: {rate} req/s | elapsed: {int(elapsed)}s"
+        )
 
 
 # ==========================================
