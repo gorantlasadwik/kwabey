@@ -1,0 +1,35 @@
+# === Secrets & Environment ===
+.env
+*.env.*
+!.env.example
+
+# === Python Cache ===
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+
+# === Virtual Environments ===
+venv/
+env/
+.venv/
+ENV/
+
+# === Local Data Files (stored in Supabase) ===
+*.csv
+*.log
+checkpoint.json
+checkpoint.json.tmp
+found_paths.txt
+
+# === IDE & OS ===
+.vscode/
+.idea/
+*.DS_Store
+Thumbs.db
+
+# === Build Artifacts ===
+dist/
+build/
+*.egg-info/
