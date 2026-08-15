@@ -21,12 +21,20 @@ from bs4 import BeautifulSoup
 import config
 import supabase_client
 
-# Configure error logger
+# Configure error logger — writes to both local file AND stdout (Render log viewer)
 logger = logging.getLogger("kwabey_scraper")
 logger.setLevel(logging.INFO)
+
+# File handler (local backup)
 file_handler = logging.FileHandler(config.ERROR_LOG_FILE, mode="a", encoding="utf-8")
 file_handler.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s"))
 logger.addHandler(file_handler)
+
+# Stdout handler so Render captures warnings/errors
+stdout_handler = logging.StreamHandler()
+stdout_handler.setLevel(logging.WARNING)  # only WARN+ to avoid duplicate INFO spam
+stdout_handler.setFormatter(logging.Formatter("%(asctime)s [SCRAPER] %(levelname)s - %(message)s"))
+logger.addHandler(stdout_handler)
 
 
 def build_url(phone_number: str, base_url: str = config.DEFAULT_BASE_URL) -> str:

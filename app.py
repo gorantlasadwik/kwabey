@@ -21,6 +21,13 @@ import supabase_client
 
 app = Flask(__name__)
 
+# Root logger → stdout so Render captures everything
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[logging.StreamHandler()],
+)
+
 # ==========================================
 # APPLICATION STATE
 # ==========================================
@@ -67,6 +74,13 @@ def broadcast_log(level: str, message: str, phone: str = "", status: str = ""):
         "phone": phone,
         "status": status,
     }
+
+    # ── Print to stdout so Render's log viewer captures it ──
+    if phone:
+        print(f"[{timestamp}] [{level}] {phone.ljust(12)} -> {message}", flush=True)
+    else:
+        print(f"[{timestamp}] [{level}] {message}", flush=True)
+
     with state.lock:
         state.recent_logs.append(entry)
         if len(state.recent_logs) > state.max_recent_logs:
